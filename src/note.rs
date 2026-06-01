@@ -24,6 +24,7 @@ pub enum TagColor {
     Cyan,
     LightRed,
     LightGreen,
+    Rgb(u8, u8, u8),
 }
 
 impl TagColor {
@@ -37,6 +38,24 @@ impl TagColor {
         TagColor::LightRed,
         TagColor::LightGreen,
     ];
+
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.strip_prefix('#').unwrap_or(s);
+        if s.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some(TagColor::Rgb(r, g, b))
+    }
+
+    pub fn hashed_from_name(name: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % Self::PALETTE.len();
+        Self::PALETTE[idx]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,14 +65,9 @@ pub struct Tag {
 }
 
 impl Tag {
-    pub fn new(name: String) -> Self {
-        let mut hasher = DefaultHasher::new();
-        name.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % TagColor::PALETTE.len();
-        Self {
-            name,
-            color: TagColor::PALETTE[idx],
-        }
+    pub fn new(name: String, color: Option<TagColor>) -> Self {
+        let color = color.unwrap_or_else(|| TagColor::hashed_from_name(&name));
+        Self { name, color }
     }
 }
 

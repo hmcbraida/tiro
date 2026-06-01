@@ -25,9 +25,14 @@ use state::{AppState, SearchState};
 
 const TICK: Duration = Duration::from_millis(100);
 
+/// Initialise the application UI.
+///
+/// Takes control of the terminal, enters raw mode, and inits the relevant
+/// UI objects.
 pub fn run<S: NoteStore>(mut engine: TiroEngine<S>) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
     let result = main_loop(&mut terminal, &mut engine);
+    // application exit: give user their terminal back
     restore_terminal(&mut terminal)?;
     result
 }

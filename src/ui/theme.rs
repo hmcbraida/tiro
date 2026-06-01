@@ -12,6 +12,7 @@ pub fn tag_color(tag: &Tag) -> Color {
         TagColor::Cyan => Color::Cyan,
         TagColor::LightRed => Color::LightRed,
         TagColor::LightGreen => Color::LightGreen,
+        TagColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
 

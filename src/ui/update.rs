@@ -348,7 +348,7 @@ fn tag_picker_submit<S: NoteStore>(
     if !filter.is_empty() {
         let visible = visible_tags_named(engine, &filter);
         if visible.is_empty() {
-            let tag = crate::note::Tag::new(filter.clone());
+            let tag = crate::note::Tag::new(filter.clone(), None);
             engine.register_tag(tag);
             tp.pending.insert(filter);
         }
