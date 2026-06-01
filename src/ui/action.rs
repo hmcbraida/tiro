@@ -2,11 +2,11 @@
 pub enum Action {
     Edit(EditOp),
 
-    // search / tag-picker list nav
+    // list navigation (search results, picker rows)
     ListUp,
     ListDown,
 
-    // Enter / Esc dispatched per mode
+    // Enter / Esc dispatched per context
     Submit,
     Cancel,
 
@@ -24,6 +24,16 @@ pub enum Action {
 
     // tag picker
     Toggle,
+
+    // agent
+    OpenAgentModal,
+    SubmitAgentPrompt,
+    AgentCancel,
+    NewAgentSession,
+    OpenSessionPicker,
+    SubmitSessionPicker,
+    ScrollTranscriptUp,
+    ScrollTranscriptDown,
 }
 
 #[derive(Debug, Clone)]

@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -15,7 +17,7 @@ pub fn render<S: NoteStore>(
     frame: &mut Frame,
     area: Rect,
     s: &SearchState,
-    engine: &TiroEngine<S>,
+    engine: &Arc<Mutex<TiroEngine<S>>>,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -50,7 +52,7 @@ fn render_results<S: NoteStore>(
     frame: &mut Frame,
     area: Rect,
     s: &SearchState,
-    engine: &TiroEngine<S>,
+    engine: &Arc<Mutex<TiroEngine<S>>>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -67,6 +69,7 @@ fn render_results<S: NoteStore>(
         return;
     }
 
+    let eng = engine.lock().expect("engine mutex");
     let date_w: usize = 10;
     let body_w = (inner.width as usize).saturating_sub(date_w + 2);
 
@@ -85,7 +88,7 @@ fn render_results<S: NoteStore>(
                 if i > 0 {
                     spans.push(Span::raw(" "));
                 }
-                spans.push(tag_span(name, engine, true));
+                spans.push(tag_span(name, &eng, true));
             }
 
             let left_text_width: usize =
@@ -105,7 +108,5 @@ fn render_results<S: NoteStore>(
     list_state.select(Some(s.cursor));
     frame.render_stateful_widget(list, inner, &mut list_state);
 
-    // hide cursor inside list area by re-placing it on input (already set in
-    // render_search_input). We leave it where the input handler put it.
     let _ = Style::default();
 }

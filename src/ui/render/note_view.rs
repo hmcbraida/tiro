@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -14,7 +16,7 @@ pub fn render<S: NoteStore>(
     frame: &mut Frame,
     area: Rect,
     nv: &NoteViewState,
-    engine: &TiroEngine<S>,
+    engine: &Arc<Mutex<TiroEngine<S>>>,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -29,14 +31,16 @@ fn render_header<S: NoteStore>(
     frame: &mut Frame,
     area: Rect,
     nv: &NoteViewState,
-    engine: &TiroEngine<S>,
+    engine: &Arc<Mutex<TiroEngine<S>>>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border())
         .title(Span::styled(" tags ", theme::dim()));
+
+    let eng = engine.lock().expect("engine mutex");
     let mut names: Vec<String> =
-        engine.get_tags().map(|t| t.name.clone()).collect();
+        eng.get_tags().map(|t| t.name.clone()).collect();
     names.sort();
 
     let mut spans: Vec<Span> = Vec::new();
@@ -53,7 +57,7 @@ fn render_header<S: NoteStore>(
             "  ".to_string()
         };
         spans.push(Span::styled(label, theme::dim()));
-        spans.push(tag_span(name, engine, active));
+        spans.push(tag_span(name, &eng, active));
     }
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line).block(block), area);

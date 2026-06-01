@@ -3,11 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     error::{Result, TiroError},
+    filter::Filter,
     note::{Note, StoredNote, Tag},
     store::NoteStore,
 };
-
-type FilterQuery = String;
 
 const PAGE_SIZE: usize = 20;
 
@@ -39,16 +38,31 @@ impl<S: NoteStore> TiroEngine<S> {
 
     pub fn get_notes_page(
         &self,
-        filter: &FilterQuery,
+        filter: &Filter,
         page_n: usize,
     ) -> Result<Vec<StoredNote>> {
         let all = self.note_store.list_all_notes()?;
         let start = page_n.saturating_mul(PAGE_SIZE);
         Ok(all
             .into_iter()
-            .filter(|n| matches_filter(n, filter))
+            .filter(|n| filter.matches(n))
             .skip(start)
             .take(PAGE_SIZE)
+            .collect())
+    }
+
+    /// Convenience search bypassing paging; used by the agent's
+    /// `search_notes` tool.
+    pub fn search(
+        &self,
+        filter: &Filter,
+        limit: usize,
+    ) -> Result<Vec<StoredNote>> {
+        let all = self.note_store.list_all_notes()?;
+        Ok(all
+            .into_iter()
+            .filter(|n| filter.matches(n))
+            .take(limit)
             .collect())
     }
 
@@ -87,16 +101,7 @@ impl<S: NoteStore> TiroEngine<S> {
     }
 }
 
-fn matches_filter(note: &StoredNote, filter: &FilterQuery) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    let q = filter.to_lowercase();
-    note.note.contents.to_lowercase().contains(&q)
-        || note.note.tags.iter().any(|t| t.to_lowercase().contains(&q))
-}
-
-fn generate_id() -> String {
+pub fn generate_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

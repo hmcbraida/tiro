@@ -1,12 +1,17 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use tokio::sync::mpsc;
+
+use crate::agent::session::AgentSession;
+use crate::agent::{AgentEvent, runtime::TurnHandle};
 use crate::note::StoredNote;
 
 use super::input::{LineEditor, TextBuffer};
 
 pub struct AppState {
-    pub mode: Mode,
+    pub base: BaseMode,
+    pub overlays: Vec<Overlay>,
     pub error: Option<ErrorBox>,
     pub quit: bool,
     pub ctrl_x_pending: bool,
@@ -15,7 +20,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(initial: SearchState) -> Self {
         Self {
-            mode: Mode::Search(initial),
+            base: BaseMode::Search(initial),
+            overlays: Vec::new(),
             error: None,
             quit: false,
             ctrl_x_pending: false,
@@ -25,12 +31,58 @@ impl AppState {
     pub fn set_error(&mut self, msg: impl Into<String>) {
         self.error = Some(ErrorBox::new(msg.into()));
     }
+
+    pub fn top_overlay(&self) -> Option<&Overlay> {
+        self.overlays.last()
+    }
+
+    #[allow(dead_code)]
+    pub fn top_overlay_mut(&mut self) -> Option<&mut Overlay> {
+        self.overlays.last_mut()
+    }
 }
 
-pub enum Mode {
+pub enum BaseMode {
     Search(SearchState),
     NoteView(NoteViewState),
+}
+
+impl BaseMode {
+    pub fn kind(&self) -> BaseModeKind {
+        match self {
+            BaseMode::Search(_) => BaseModeKind::Search,
+            BaseMode::NoteView(_) => BaseModeKind::NoteView,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseModeKind {
+    Search,
+    NoteView,
+}
+
+pub enum Overlay {
     TagPicker(TagPickerState),
+    AgentModal(AgentModalState),
+    SessionPicker(SessionPickerState),
+}
+
+impl Overlay {
+    pub fn kind(&self) -> OverlayKind {
+        match self {
+            Overlay::TagPicker(_) => OverlayKind::TagPicker,
+            Overlay::AgentModal(_) => OverlayKind::AgentModal,
+            Overlay::SessionPicker(_) => OverlayKind::SessionPicker,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    TagPicker,
+    AgentModal,
+    SessionPicker,
 }
 
 pub struct SearchState {
@@ -61,10 +113,54 @@ pub struct NoteViewState {
 }
 
 pub struct TagPickerState {
-    pub origin: Box<NoteViewState>,
     pub filter: LineEditor,
     pub cursor: usize,
     pub pending: HashSet<String>,
+}
+
+pub struct AgentModalState {
+    pub session: AgentSession,
+    pub input: LineEditor,
+    pub scroll: u16,
+    /// Set while a turn is streaming. When `Some`, the input area is
+    /// replaced with a spinner + cancel hint.
+    pub in_flight: Option<InFlight>,
+    /// Tokens accumulated for the assistant message being streamed right
+    /// now (drained into `session.messages` on AssistantMessageComplete).
+    pub streaming_text: String,
+}
+
+pub struct InFlight {
+    pub events: mpsc::UnboundedReceiver<AgentEvent>,
+    pub cancel: Option<TurnHandle>,
+}
+
+impl AgentModalState {
+    pub fn new(session: AgentSession) -> Self {
+        Self {
+            session,
+            input: LineEditor::new(),
+            scroll: 0,
+            in_flight: None,
+            streaming_text: String::new(),
+        }
+    }
+}
+
+pub struct SessionPickerState {
+    pub filter: LineEditor,
+    pub cursor: usize,
+    pub sessions: Vec<AgentSession>,
+}
+
+impl SessionPickerState {
+    pub fn new(sessions: Vec<AgentSession>) -> Self {
+        Self {
+            filter: LineEditor::new(),
+            cursor: 0,
+            sessions,
+        }
+    }
 }
 
 pub struct ErrorBox {

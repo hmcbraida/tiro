@@ -7,32 +7,35 @@ pub mod theme;
 pub mod update;
 
 use std::io::{self, Stdout};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode,
 };
+use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::agent::AgentRuntime;
 use crate::engine::TiroEngine;
+use crate::filter::Filter;
 use crate::store::NoteStore;
 
+use keymap::Keymap;
 use state::{AppState, SearchState};
 
 const TICK: Duration = Duration::from_millis(100);
 
-/// Initialise the application UI.
-///
-/// Takes control of the terminal, enters raw mode, and inits the relevant
-/// UI objects.
-pub fn run<S: NoteStore>(mut engine: TiroEngine<S>) -> io::Result<()> {
+pub async fn run<S: NoteStore + Send + 'static>(
+    engine: Arc<Mutex<TiroEngine<S>>>,
+    runtime: AgentRuntime,
+) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = main_loop(&mut terminal, &mut engine);
-    // application exit: give user their terminal back
+    let result = main_loop(&mut terminal, engine, runtime).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -53,37 +56,54 @@ fn restore_terminal(
     Ok(())
 }
 
-fn main_loop<S: NoteStore>(
+async fn main_loop<S: NoteStore + Send + 'static>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    engine: &mut TiroEngine<S>,
+    engine: Arc<Mutex<TiroEngine<S>>>,
+    runtime: AgentRuntime,
 ) -> io::Result<()> {
+    let keymap = Keymap::default();
+
     let mut search = SearchState::new();
-    if let Ok(rows) = engine.get_notes_page(&String::new(), 0) {
-        search.results = rows;
+    {
+        let filter = Filter::parse(&search.query.text());
+        if let Ok(rows) = engine
+            .lock()
+            .expect("engine mutex")
+            .get_notes_page(&filter, 0)
+        {
+            search.results = rows;
+        }
     }
     let mut state = AppState::new(search);
 
-    while !state.quit {
-        terminal.draw(|f| render::dispatch(&state, engine, f))?;
+    let mut events = EventStream::new();
+    let mut tick_interval = tokio::time::interval(TICK);
 
-        if event::poll(TICK)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    use crossterm::event::KeyEventKind;
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+    while !state.quit {
+        terminal.draw(|f| render::dispatch(&state, &engine, f))?;
+
+        tokio::select! {
+            biased;
+            maybe_ev = events.next() => {
+                match maybe_ev {
+                    Some(Ok(Event::Key(key))) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        let _dismissed_error = state.error.take().is_some();
+                        if let Some(action) = keymap.translate(key, &state) {
+                            update::apply(&mut state, action, &engine, &runtime);
+                        }
                     }
-                    let dismissed_error = state.error.take().is_some();
-                    if let Some(action) = keymap::translate(key, &state) {
-                        update::apply(&mut state, action, engine);
-                    }
-                    let _ = dismissed_error;
+                    Some(Ok(Event::Resize(_, _))) => {}
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e),
+                    None => break,
                 }
-                Event::Resize(_, _) => {}
-                _ => {}
             }
-        } else {
-            update::tick(&mut state, engine);
+            _ = tick_interval.tick() => {
+                update::tick(&mut state, &engine, &runtime);
+            }
         }
     }
     Ok(())

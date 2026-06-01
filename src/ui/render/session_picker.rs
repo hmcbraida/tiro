@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use chrono::{DateTime, Local};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -7,27 +7,18 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph,
 };
 
-use crate::engine::TiroEngine;
-use crate::store::NoteStore;
-
-use super::super::state::TagPickerState;
+use super::super::state::SessionPickerState;
 use super::super::theme;
-use super::super::update::visible_tags_for;
-use super::widgets::tag_span;
+use super::super::update::visible_sessions;
 
-pub fn render<S: NoteStore>(
-    frame: &mut Frame,
-    area: Rect,
-    tp: &TagPickerState,
-    engine: &Arc<Mutex<TiroEngine<S>>>,
-) {
-    let popup = centered(area, 50, 60);
+pub fn render(frame: &mut Frame, area: Rect, sp: &SessionPickerState) {
+    let popup = centered(area, 70, 70);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border())
-        .title(Span::styled(" tags ", theme::dim()));
+        .title(Span::styled(" sessions ", theme::dim()));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -36,39 +27,33 @@ pub fn render<S: NoteStore>(
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
-    let filter_text = if tp.filter.is_empty() {
+    let filter_text = if sp.filter.is_empty() {
         Line::from(Span::styled("filter…", theme::placeholder()))
     } else {
-        Line::from(Span::raw(tp.filter.text()))
+        Line::from(Span::raw(sp.filter.text()))
     };
     frame.render_widget(Paragraph::new(filter_text), chunks[0]);
     frame.set_cursor_position((
-        chunks[0].x + tp.filter.cursor() as u16,
+        chunks[0].x + sp.filter.cursor() as u16,
         chunks[0].y,
     ));
 
-    let names = visible_tags_for(tp, engine);
-    let eng = engine.lock().expect("engine mutex");
-    let items: Vec<ListItem> = names
+    let visible = visible_sessions(sp);
+    let items: Vec<ListItem> = visible
         .iter()
-        .map(|name| {
-            let mark = if tp.pending.contains(name) {
-                "[x] "
-            } else {
-                "[ ] "
-            };
-            let line = Line::from(vec![
-                Span::raw(mark),
-                tag_span(name, &eng, tp.pending.contains(name)),
-            ]);
-            ListItem::new(line)
+        .map(|&i| {
+            let s = &sp.sessions[i];
+            let when: DateTime<Local> = s.created_at.into();
+            let label =
+                format!("{}  --  {}", when.format("%Y-%m-%d %H:%M"), s.title());
+            ListItem::new(Line::from(Span::raw(label)))
         })
         .collect();
 
     let list = List::new(items).highlight_style(theme::highlight());
     let mut list_state = ListState::default();
-    if !names.is_empty() {
-        list_state.select(Some(tp.cursor.min(names.len() - 1)));
+    if !visible.is_empty() {
+        list_state.select(Some(sp.cursor.min(visible.len() - 1)));
     }
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 }

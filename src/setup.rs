@@ -1,33 +1,55 @@
 //! Startup configuration loading.
+//!
+//! `load_config` reads the toml at `path`, resolves any file-backed paths
+//! (api keys, system prompts) relative to its directory, and returns the
+//! tag set + resolved [`AgentConfig`].
 
 use std::path::Path;
 use std::{fmt, fs, io};
 
 use serde::Deserialize;
 
+use crate::agent::config::{AgentConfig, AgentConfigError, RawAgent};
 use crate::note::{Tag, TagColor};
 
-/// Load the user's tag set from the TOML config at `path`.
-pub fn load_tags(path: &Path) -> Result<Vec<Tag>, ConfigError> {
+pub struct LoadedConfig {
+    pub tags: Vec<Tag>,
+    pub agent: AgentConfig,
+}
+
+pub fn load_config(path: &Path) -> Result<LoadedConfig, ConfigError> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(default_tags());
+            return Ok(LoadedConfig {
+                tags: default_tags(),
+                agent: AgentConfig::disabled(),
+            });
         }
         Err(e) => return Err(ConfigError::Io(e)),
     };
     let raw: RawConfig = toml::from_str(&text).map_err(ConfigError::Parse)?;
-    raw.tag.into_iter().map(RawTag::into_tag).collect()
+    let tags: Result<Vec<Tag>, _> =
+        raw.tag.into_iter().map(RawTag::into_tag).collect();
+    let tags = tags?;
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let agent = raw
+        .agent
+        .unwrap_or_default()
+        .resolve(config_dir)
+        .map_err(ConfigError::Agent)?;
+    Ok(LoadedConfig { tags, agent })
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     tag: Vec<RawTag>,
+    #[serde(default)]
+    agent: Option<RawAgent>,
 }
 
 #[derive(Debug, Deserialize)]
-/// A tag as deserialised from the toml.
 struct RawTag {
     name: String,
     color: Option<String>,
@@ -60,6 +82,7 @@ pub enum ConfigError {
     Io(io::Error),
     Parse(toml::de::Error),
     BadColor { tag: String, value: String },
+    Agent(AgentConfigError),
 }
 
 impl fmt::Display for ConfigError {
@@ -72,6 +95,7 @@ impl fmt::Display for ConfigError {
                 "tag '{tag}' has invalid color '{value}' \
                  (expected #rrggbb hex)"
             ),
+            ConfigError::Agent(e) => write!(f, "agent config: {e}"),
         }
     }
 }
@@ -82,6 +106,7 @@ impl std::error::Error for ConfigError {
             ConfigError::Io(e) => Some(e),
             ConfigError::Parse(e) => Some(e),
             ConfigError::BadColor { .. } => None,
+            ConfigError::Agent(e) => Some(e),
         }
     }
 }
@@ -111,7 +136,6 @@ name = "world"
         assert_eq!(tags[0].name, "hello");
         assert_eq!(tags[0].color, TagColor::Rgb(0xff, 0x00, 0xee));
         assert_eq!(tags[1].name, "world");
-        // "world" has no explicit color -- the hashed fallback kicks in.
         assert_eq!(tags[1].color, TagColor::hashed_from_name("world"));
     }
 
