@@ -1,0 +1,34 @@
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "no-ai-dash"
+name = "Replace em dashes with -- "
+language = "system"
+entry = "sh -c 'for f in \"$@\"; do sed -i \"s/— /-- /g\" \"$f\"; done' --"
+types = ["text"]
+exclude = {glob = ["^bun\\.lock$", "prek\\.toml"]}
+
+[[repos.hooks]]
+id = "rust_fmt"
+name = "Format (rustfmt)"
+language = "system"
+entry = "cargo fmt"
+pass_filenames = false
+always_run = true
+
+[[repos.hooks]]
+id = "rust_lint"
+name = "Lint (clippy)"
+language = "system"
+entry = "cargo clippy -- -Dwarnings"
+pass_filenames = false
+always_run = true
+
+[[repos.hooks]]
+id = "rust_test"
+name = "Test rust"
+language = "system"
+entry = "cargo test"
+pass_filenames = false
+always_run = true
