@@ -10,11 +10,14 @@ use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode,
+    enable_raw_mode, supports_keyboard_enhancement,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -34,22 +37,41 @@ pub async fn run<S: NoteStore + Send + 'static>(
     engine: Arc<Mutex<TiroEngine<S>>>,
     runtime: AgentRuntime,
 ) -> io::Result<()> {
-    let mut terminal = setup_terminal()?;
+    let (mut terminal, enhanced_kbd) = setup_terminal()?;
     let result = main_loop(&mut terminal, engine, runtime).await;
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, enhanced_kbd)?;
     result
 }
 
-fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+fn setup_terminal() -> io::Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    // Ask supporting terminals (kitty, foot, wezterm, ghostty, alacritty
+    // >=0.13, recent iTerm2) to disambiguate keys like Ctrl+/ vs Ctrl+_
+    // and report shifted variants. On unsupported terminals these keys
+    // remain ambiguous, but legacy bindings still work.
+    let enhanced_kbd = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced_kbd {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+            )
+        )?;
+    }
+    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    Ok((terminal, enhanced_kbd))
 }
 
 fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    enhanced_kbd: bool,
 ) -> io::Result<()> {
+    if enhanced_kbd {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

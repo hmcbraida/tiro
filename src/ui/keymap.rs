@@ -125,7 +125,9 @@ impl Default for Keymap {
                 context: ContextMatcher::Any,
                 action: Action::StartCtrlX,
             },
-            // ---- Ctrl+? -> Open agent modal ----
+            // ---- Ctrl+/ -> Open agent modal ----
+            // Requires a terminal with the kitty keyboard protocol; on
+            // legacy terminals Ctrl+/ collapses to Ctrl+_ at byte 0x1F.
             Binding {
                 key: KeySpec::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
                 context: ContextMatcher::Any,
@@ -362,4 +364,272 @@ pub fn translate_edit_multiline(event: &KeyEvent) -> Option<EditOp> {
         _ => {}
     }
     translate_edit_line(event)
+}
+
+// ---------------------------------------------------------------------
+// Config-string parser for [`KeySpec`].
+//
+// Syntax mirrors Helix:
+//
+//   "C-w"          Ctrl+w
+//   "A-ret"        Alt+Enter
+//   "C-A-S-F12"    Ctrl+Alt+Shift+F12
+//   "space"        Space
+//   "/"            literal slash
+//   "C-minus"      Ctrl+-
+//
+// Modifiers (prefix, hyphen-separated, any order): `S` Shift, `A` Alt,
+// `C` Ctrl, `Meta`/`Cmd`/`Win` Super.
+//
+// Named keys: ret, tab, esc, space, backspace, del, ins, up, down,
+// left, right, home, end, pageup, pagedown, minus, lt, gt, f1..f24.
+//
+// Normalization: shift + ASCII lowercase letter collapses to uppercase
+// without SHIFT (so `C-S-a` == `C-A`), matching how legacy terminals
+// encode the key. Named-key tokens are case-insensitive.
+// ---------------------------------------------------------------------
+
+#[allow(dead_code)] // wired into config loading in a follow-up
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseKeyError {
+    Empty,
+    UnknownModifier(String),
+    UnknownKey(String),
+    MissingKey,
+}
+
+impl std::fmt::Display for ParseKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseKeyError::Empty => write!(f, "empty key binding"),
+            ParseKeyError::UnknownModifier(s) => {
+                write!(f, "unknown modifier '{s}'")
+            }
+            ParseKeyError::UnknownKey(s) => write!(f, "unknown key '{s}'"),
+            ParseKeyError::MissingKey => {
+                write!(f, "binding has modifiers but no key")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseKeyError {}
+
+#[allow(dead_code)] // wired into config loading in a follow-up
+pub fn parse_key(s: &str) -> Result<KeySpec, ParseKeyError> {
+    if s.is_empty() {
+        return Err(ParseKeyError::Empty);
+    }
+    // A single character -- including '-' itself -- is always a literal key.
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if chars.next().is_none() {
+        return Ok(normalize(KeySpec::new(
+            KeyCode::Char(first),
+            KeyModifiers::NONE,
+        )));
+    }
+    // Otherwise split on '-'. Every token before the last is a modifier;
+    // the last is the key. To bind Ctrl+minus, write `C-minus`.
+    let parts: Vec<&str> = s.split('-').collect();
+    let (key_token, mod_tokens) = parts
+        .split_last()
+        .map(|(last, rest)| (*last, rest))
+        .ok_or(ParseKeyError::Empty)?;
+    if key_token.is_empty() {
+        return Err(ParseKeyError::MissingKey);
+    }
+    let mut modifiers = KeyModifiers::NONE;
+    for tok in mod_tokens {
+        match *tok {
+            "S" => modifiers |= KeyModifiers::SHIFT,
+            "A" => modifiers |= KeyModifiers::ALT,
+            "C" => modifiers |= KeyModifiers::CONTROL,
+            "Meta" | "Cmd" | "Win" => modifiers |= KeyModifiers::SUPER,
+            other => {
+                return Err(ParseKeyError::UnknownModifier(other.to_string()));
+            }
+        }
+    }
+    let code = parse_keycode(key_token)?;
+    Ok(normalize(KeySpec::new(code, modifiers)))
+}
+
+fn parse_keycode(token: &str) -> Result<KeyCode, ParseKeyError> {
+    let mut chars = token.chars();
+    let first = chars.next().ok_or(ParseKeyError::MissingKey)?;
+    if chars.next().is_none() {
+        return Ok(KeyCode::Char(first));
+    }
+    let lower = token.to_ascii_lowercase();
+    let code = match lower.as_str() {
+        "ret" | "enter" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "esc" | "escape" => KeyCode::Esc,
+        "space" => KeyCode::Char(' '),
+        "backspace" | "bs" => KeyCode::Backspace,
+        "del" | "delete" => KeyCode::Delete,
+        "ins" | "insert" => KeyCode::Insert,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "minus" => KeyCode::Char('-'),
+        "lt" => KeyCode::Char('<'),
+        "gt" => KeyCode::Char('>'),
+        other if other.starts_with('f') => {
+            let n: u8 = other[1..]
+                .parse()
+                .map_err(|_| ParseKeyError::UnknownKey(token.to_string()))?;
+            if !(1..=24).contains(&n) {
+                return Err(ParseKeyError::UnknownKey(token.to_string()));
+            }
+            KeyCode::F(n)
+        }
+        _ => return Err(ParseKeyError::UnknownKey(token.to_string())),
+    };
+    Ok(code)
+}
+
+fn normalize(spec: KeySpec) -> KeySpec {
+    // Helix-style: Shift + ASCII lowercase folds to uppercase with no
+    // SHIFT modifier -- that's what legacy terminals deliver anyway.
+    if let KeyCode::Char(c) = spec.code
+        && c.is_ascii_lowercase()
+        && spec.mods.contains(KeyModifiers::SHIFT)
+    {
+        return KeySpec::new(
+            KeyCode::Char(c.to_ascii_uppercase()),
+            spec.mods - KeyModifiers::SHIFT,
+        );
+    }
+    spec
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn k(code: KeyCode, mods: KeyModifiers) -> KeySpec {
+        KeySpec::new(code, mods)
+    }
+
+    #[test]
+    fn bare_chars() {
+        assert_eq!(
+            parse_key("a"),
+            Ok(k(KeyCode::Char('a'), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key("/"),
+            Ok(k(KeyCode::Char('/'), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key("-"),
+            Ok(k(KeyCode::Char('-'), KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn single_modifier() {
+        assert_eq!(
+            parse_key("C-w"),
+            Ok(k(KeyCode::Char('w'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            parse_key("A-x"),
+            Ok(k(KeyCode::Char('x'), KeyModifiers::ALT))
+        );
+    }
+
+    #[test]
+    fn shift_lowercase_normalizes_to_uppercase() {
+        assert_eq!(
+            parse_key("S-a"),
+            Ok(k(KeyCode::Char('A'), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key("C-S-a"),
+            Ok(k(KeyCode::Char('A'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn multi_modifier_any_order() {
+        let want = k(
+            KeyCode::F(12),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(parse_key("C-A-S-F12"), Ok(want.clone()));
+        assert_eq!(parse_key("S-A-C-F12"), Ok(want));
+    }
+
+    #[test]
+    fn named_keys() {
+        assert_eq!(parse_key("ret"), Ok(k(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(
+            parse_key("A-ret"),
+            Ok(k(KeyCode::Enter, KeyModifiers::ALT))
+        );
+        assert_eq!(
+            parse_key("space"),
+            Ok(k(KeyCode::Char(' '), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key("C-minus"),
+            Ok(k(KeyCode::Char('-'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn ctrl_slash_is_distinct_from_ctrl_underscore() {
+        // The parser treats these as separate identifiers; runtime
+        // distinguishability depends on the kitty keyboard protocol.
+        assert_eq!(
+            parse_key("C-/"),
+            Ok(k(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            parse_key("C-_"),
+            Ok(k(KeyCode::Char('_'), KeyModifiers::CONTROL))
+        );
+        assert_ne!(parse_key("C-/"), parse_key("C-_"));
+    }
+
+    #[test]
+    fn meta_aliases() {
+        let want = k(KeyCode::Char('x'), KeyModifiers::SUPER);
+        assert_eq!(parse_key("Meta-x"), Ok(want.clone()));
+        assert_eq!(parse_key("Cmd-x"), Ok(want.clone()));
+        assert_eq!(parse_key("Win-x"), Ok(want));
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(parse_key("F1"), Ok(k(KeyCode::F(1), KeyModifiers::NONE)));
+        assert_eq!(parse_key("f24"), Ok(k(KeyCode::F(24), KeyModifiers::NONE)));
+        assert!(matches!(parse_key("F0"), Err(ParseKeyError::UnknownKey(_))));
+        assert!(matches!(
+            parse_key("F25"),
+            Err(ParseKeyError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn errors() {
+        assert_eq!(parse_key(""), Err(ParseKeyError::Empty));
+        assert!(matches!(
+            parse_key("X-a"),
+            Err(ParseKeyError::UnknownModifier(_))
+        ));
+        assert!(matches!(
+            parse_key("C-bogus"),
+            Err(ParseKeyError::UnknownKey(_))
+        ));
+        assert_eq!(parse_key("C-"), Err(ParseKeyError::MissingKey));
+    }
 }
