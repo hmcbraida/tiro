@@ -12,6 +12,7 @@ use crate::note::Note;
 use crate::store::NoteStore;
 
 use super::action::{Action, EditOp};
+use super::input::wrap;
 use super::input::{LineEditor, TextBuffer};
 use super::state::{
     AgentModalState, AppState, BaseMode, ErrorBox, InFlight, NoteViewState,
@@ -258,11 +259,64 @@ fn apply_edit<S: NoteStore + Send + 'static>(
             }
         }
         BaseMode::NoteView(nv) => {
-            apply_multiline(&mut nv.buffer, op);
+            match &op {
+                EditOp::Up => {
+                    apply_visual_vertical(nv, -1);
+                }
+                EditOp::Down => {
+                    apply_visual_vertical(nv, 1);
+                }
+                _ => {
+                    nv.desired_vcol = None;
+                    apply_multiline(&mut nv.buffer, op);
+                }
+            }
             nv.dirty = true;
             nv.last_edit = Instant::now();
         }
     }
+}
+
+fn apply_visual_vertical(nv: &mut NoteViewState, delta: i32) {
+    let width = nv.last_view_width as usize;
+    if width == 0 {
+        // No render yet -- fall back to buffer-line movement.
+        if delta < 0 {
+            nv.buffer.up();
+        } else {
+            nv.buffer.down();
+        }
+        return;
+    }
+    let lines = nv.buffer.lines();
+    let (mapping_lines, mapping) = wrap::wrap_lines(lines, width);
+    let _ = mapping_lines;
+    let (row, col) = nv.buffer.cursor();
+    let (cur_vrow, cur_vcol) =
+        wrap::buffer_to_visual(&mapping, lines, row, col);
+
+    let target_vcol = nv.desired_vcol.map(|v| v as usize).unwrap_or(cur_vcol);
+
+    let target_vrow = if delta < 0 {
+        if cur_vrow == 0 {
+            // At top -- preserve buffer cursor; record desired column.
+            nv.desired_vcol = Some(target_vcol as u16);
+            return;
+        }
+        cur_vrow - 1
+    } else {
+        let last_vrow = mapping.total_visual_rows.saturating_sub(1);
+        if cur_vrow >= last_vrow {
+            nv.desired_vcol = Some(target_vcol as u16);
+            return;
+        }
+        cur_vrow + 1
+    };
+
+    let (new_row, new_col) =
+        wrap::visual_to_buffer(&mapping, lines, target_vrow, target_vcol);
+    nv.buffer.set_cursor(new_row, new_col);
+    nv.desired_vcol = Some(target_vcol as u16);
 }
 
 fn submit_search(state: &mut AppState) {
@@ -280,6 +334,9 @@ fn submit_search(state: &mut AppState) {
             prev_search: Box::new(s),
             dirty: false,
             last_edit: Instant::now(),
+            desired_vcol: None,
+            scroll_offset: 0,
+            last_view_width: 0,
         };
         state.base = BaseMode::NoteView(nv);
     } else {
@@ -353,6 +410,9 @@ fn new_note_flow<S: NoteStore + Send + 'static>(
                 prev_search: Box::new(prev),
                 dirty: false,
                 last_edit: Instant::now(),
+                desired_vcol: None,
+                scroll_offset: 0,
+                last_view_width: 0,
             };
             state.base = BaseMode::NoteView(nv);
         }

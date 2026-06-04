@@ -102,7 +102,7 @@ async fn main_loop<S: NoteStore + Send + 'static>(
     let mut tick_interval = tokio::time::interval(TICK);
 
     while !state.quit {
-        terminal.draw(|f| render::dispatch(&state, &engine, f))?;
+        terminal.draw(|f| render::dispatch(&mut state, &engine, f))?;
 
         tokio::select! {
             biased;

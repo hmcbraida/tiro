@@ -45,6 +45,12 @@ impl TextBuffer {
         self.cursor
     }
 
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        let r = row.min(self.lines.len().saturating_sub(1));
+        let c = col.min(self.lines[r].len());
+        self.cursor = (r, c);
+    }
+
     pub fn lines(&self) -> &[Vec<char>] {
         &self.lines
     }

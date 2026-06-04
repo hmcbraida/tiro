@@ -110,6 +110,16 @@ pub struct NoteViewState {
     pub prev_search: Box<SearchState>,
     pub dirty: bool,
     pub last_edit: Instant,
+    /// Sticky desired visual column for vertical movement through wrapped /
+    /// short lines. Set on the first up/down, cleared on any horizontal or
+    /// editing op.
+    pub desired_vcol: Option<u16>,
+    /// Top visible visual row of the body. Adjusted at render time to keep
+    /// the cursor on-screen.
+    pub scroll_offset: u16,
+    /// Inner body width recorded on the last render, used by update.rs to
+    /// compute visual up/down before the next render. Zero before any render.
+    pub last_view_width: u16,
 }
 
 pub struct TagPickerState {

@@ -16,12 +16,12 @@ use crate::store::NoteStore;
 use super::state::{AppState, BaseMode, Overlay};
 
 pub fn dispatch<S: NoteStore>(
-    state: &AppState,
+    state: &mut AppState,
     engine: &Arc<Mutex<TiroEngine<S>>>,
     frame: &mut Frame,
 ) {
     let area = frame.area();
-    match &state.base {
+    match &mut state.base {
         BaseMode::Search(s) => search::render(frame, area, s, engine),
         BaseMode::NoteView(nv) => note_view::render(frame, area, nv, engine),
     }
