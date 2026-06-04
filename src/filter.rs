@@ -3,7 +3,8 @@
 //! Whitespace-separated tokens:
 //! - `tag:NAME` requires a tag,
 //! - `-tag:NAME` excludes a tag,
-//! - any other token contributes to the text query.
+//! - any other token is a text term; every text term must match the note
+//!   (orderless AND) against either the contents or any tag.
 //!
 //! Parsing is infallible: malformed input degrades to text.
 
@@ -11,37 +12,37 @@ use crate::note::StoredNote;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Filter {
-    pub text: String,
+    pub text_terms: Vec<String>,
     pub require_tags: Vec<String>,
     pub exclude_tags: Vec<String>,
 }
 
 impl Filter {
     pub fn parse(input: &str) -> Self {
-        let mut text_parts: Vec<&str> = Vec::new();
+        let mut text_terms: Vec<String> = Vec::new();
         let mut require_tags: Vec<String> = Vec::new();
         let mut exclude_tags: Vec<String> = Vec::new();
 
         for tok in input.split_whitespace() {
             if let Some(name) = tok.strip_prefix("tag:") {
                 if name.is_empty() || !is_valid_tag(name) {
-                    text_parts.push(tok);
+                    text_terms.push(tok.to_lowercase());
                 } else {
                     require_tags.push(name.to_string());
                 }
             } else if let Some(name) = tok.strip_prefix("-tag:") {
                 if name.is_empty() || !is_valid_tag(name) {
-                    text_parts.push(tok);
+                    text_terms.push(tok.to_lowercase());
                 } else {
                     exclude_tags.push(name.to_string());
                 }
             } else {
-                text_parts.push(tok);
+                text_terms.push(tok.to_lowercase());
             }
         }
 
         Filter {
-            text: text_parts.join(" "),
+            text_terms,
             require_tags,
             exclude_tags,
         }
@@ -49,7 +50,7 @@ impl Filter {
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.text_terms.is_empty()
             && self.require_tags.is_empty()
             && self.exclude_tags.is_empty()
     }
@@ -65,12 +66,15 @@ impl Filter {
                 return false;
             }
         }
-        if self.text.is_empty() {
+        if self.text_terms.is_empty() {
             return true;
         }
-        let q = self.text.to_lowercase();
-        note.note.contents.to_lowercase().contains(&q)
-            || note.note.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        let contents = note.note.contents.to_lowercase();
+        let tags: Vec<String> =
+            note.note.tags.iter().map(|t| t.to_lowercase()).collect();
+        self.text_terms.iter().all(|term| {
+            contents.contains(term) || tags.iter().any(|t| t.contains(term))
+        })
     }
 }
 
@@ -149,7 +153,7 @@ mod tests {
     fn bare_tag_prefix_is_text() {
         let f = Filter::parse("tag:");
         assert!(f.require_tags.is_empty());
-        assert_eq!(f.text, "tag:");
+        assert_eq!(f.text_terms, vec!["tag:"]);
     }
 
     #[test]
@@ -159,10 +163,26 @@ mod tests {
         // token is "tag:has" -- has only alphanumeric, so still treated as a
         // tag. The "space" token is text.
         assert_eq!(f.require_tags, vec!["has"]);
-        assert_eq!(f.text, "space");
+        assert_eq!(f.text_terms, vec!["space"]);
 
         let f = Filter::parse("tag:a/b");
         assert!(f.require_tags.is_empty());
-        assert_eq!(f.text, "tag:a/b");
+        assert_eq!(f.text_terms, vec!["tag:a/b"]);
+    }
+
+    #[test]
+    fn multiple_text_terms_anded_orderless() {
+        let f = Filter::parse("sarah birthday");
+        assert!(f.matches(&note("sarah's birthday is tomorrow", &[])));
+        assert!(f.matches(&note("birthday party for sarah", &[])));
+        assert!(!f.matches(&note("sarah went home", &[])));
+        assert!(!f.matches(&note("happy birthday", &[])));
+    }
+
+    #[test]
+    fn text_terms_can_match_across_contents_and_tags() {
+        let f = Filter::parse("sarah birthday");
+        assert!(f.matches(&note("sarah came over", &["birthday"])));
+        assert!(f.matches(&note("cake time", &["sarah", "birthday"])));
     }
 }

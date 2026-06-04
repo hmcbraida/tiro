@@ -68,7 +68,7 @@ where
         ToolDefinition {
             name: Self::NAME.to_string(),
             description:
-                "Search notes. You can query tags with tag:NAME and -tag:NAME"
+                "Search notes. Try searching for word roots: so 'dog' not 'dogs'. You can query tags with tag:NAME and -tag:NAME"
                     .to_string(),
             parameters: json!({
                 "type": "object",
