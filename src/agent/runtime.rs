@@ -1,16 +1,23 @@
-//! Agent runtime: owns the LLM backend + session store, and drives one
-//! streaming turn at a time when the UI asks for it.
+//! Agent runtime: owns one rig provider client per configured backend
+//! plus the session store, and drives one streaming turn at a time when
+//! the UI asks for it.
+//!
+//! Rig's `Agent::stream_chat` runs the multi-turn tool loop internally;
+//! we just translate its events back onto our existing transcript +
+//! [`AgentEvent`] shape so the rest of the app is untouched.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use llm::{
-    LLMProvider,
-    builder::{LLMBackend, LLMBuilder},
-    chat::{
-        ChatMessage, ChatRole, FunctionTool, MessageType, StreamChunk, Tool,
-    },
+use rig::agent::MultiTurnStreamItem;
+use rig::client::CompletionClient;
+use rig::completion::{CompletionModel, GetTokenUsage, Message};
+use rig::message::{Text, ToolResultContent, UserContent};
+use rig::providers::{anthropic, ollama, openai};
+use rig::streaming::{
+    StreamedAssistantContent, StreamedUserContent, StreamingChat,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -18,31 +25,31 @@ use tokio::sync::{mpsc, oneshot};
 use crate::agent::config::{AgentConfig, Provider};
 use crate::agent::session::{AgentSession, TranscriptMessage};
 use crate::agent::store::{DirectorySessionStore, SessionStore};
-use crate::agent::tools::{ToolSpec, all_specs, dispatch as dispatch_tool};
+use crate::agent::tools::build_tools;
 use crate::engine::TiroEngine;
 use crate::store::NoteStore;
+
+const MAX_TURNS: usize = 8;
 
 pub enum AgentRuntime {
     Disabled,
     Enabled(EnabledAgent),
 }
 
-/// `Box<dyn LLMProvider>` is technically not `Send + Sync` because the
-/// trait object discards its supertrait bounds -- even though every concrete
-/// impl is required to be `Send + Sync` (via `ChatProvider: Send + Sync`).
-/// The wrapper makes the bound explicit so the value can cross task
-/// boundaries via `Arc`.
-pub(crate) struct SendableProvider(pub Box<dyn LLMProvider>);
-unsafe impl Send for SendableProvider {}
-unsafe impl Sync for SendableProvider {}
+/// One configured provider client. Each variant is a rig client that
+/// implements [`CompletionClient`]; the variant is chosen once at config
+/// load and dispatched on per turn.
+pub enum BackendClient {
+    OpenAi(openai::Client),
+    Anthropic(anthropic::Client),
+    Ollama(ollama::Client),
+}
 
 pub struct EnabledAgent {
-    pub(crate) backend: Arc<SendableProvider>,
-    #[allow(dead_code)]
+    pub(crate) backend: Arc<BackendClient>,
     pub system_prompt: String,
     pub session_store: Arc<dyn SessionStore>,
-    #[allow(dead_code)]
-    pub model_label: String,
+    pub model: String,
     #[allow(dead_code)]
     pub provider_label: &'static str,
 }
@@ -60,10 +67,10 @@ impl AgentRuntime {
         let backend = build_backend(&cfg)?;
         let store = DirectorySessionStore::new(sessions_dir);
         Ok(AgentRuntime::Enabled(EnabledAgent {
-            backend: Arc::new(SendableProvider(backend)),
+            backend: Arc::new(backend),
             system_prompt: cfg.system_prompt,
             session_store: Arc::new(store),
-            model_label: cfg.model,
+            model: cfg.model,
             provider_label: cfg.provider.label(),
         }))
     }
@@ -83,35 +90,39 @@ impl AgentRuntime {
 
 fn build_backend(
     cfg: &AgentConfig,
-) -> Result<Box<dyn LLMProvider>, RuntimeBuildError> {
-    let backend = match cfg.provider {
-        Provider::OpenAi => LLMBackend::OpenAI,
-        Provider::Anthropic => LLMBackend::Anthropic,
-        Provider::Ollama => LLMBackend::Ollama,
+) -> Result<BackendClient, RuntimeBuildError> {
+    match cfg.provider {
+        Provider::OpenAi => {
+            let key = cfg.api_key.as_deref().unwrap_or("");
+            openai::Client::new(key)
+                .map(BackendClient::OpenAi)
+                .map_err(|e| RuntimeBuildError::Client(e.to_string()))
+        }
+        Provider::Anthropic => {
+            let key = cfg.api_key.as_deref().unwrap_or("");
+            anthropic::Client::new(key)
+                .map(BackendClient::Anthropic)
+                .map_err(|e| RuntimeBuildError::Client(e.to_string()))
+        }
+        Provider::Ollama => ollama::Client::builder()
+            .api_key(rig::client::Nothing)
+            .base_url(&cfg.ollama_url)
+            .build()
+            .map(BackendClient::Ollama)
+            .map_err(|e| RuntimeBuildError::Client(e.to_string())),
         Provider::None => unreachable!(),
-    };
-    let mut builder = LLMBuilder::new()
-        .backend(backend)
-        .model(&cfg.model)
-        .system(&cfg.system_prompt);
-    if let Some(key) = &cfg.api_key {
-        builder = builder.api_key(key);
     }
-    if matches!(cfg.provider, Provider::Ollama) {
-        builder = builder.base_url(&cfg.ollama_url);
-    }
-    builder.build().map_err(RuntimeBuildError::Llm)
 }
 
 #[derive(Debug)]
 pub enum RuntimeBuildError {
-    Llm(llm::error::LLMError),
+    Client(String),
 }
 
 impl std::fmt::Display for RuntimeBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RuntimeBuildError::Llm(e) => write!(f, "llm backend: {e}"),
+            RuntimeBuildError::Client(e) => write!(f, "rig client: {e}"),
         }
     }
 }
@@ -155,6 +166,8 @@ pub fn spawn_turn<S: NoteStore + Send + 'static>(
 ) -> (TurnHandle, tokio::task::JoinHandle<AgentSession>) {
     let backend = agent.backend.clone();
     let store = agent.session_store.clone();
+    let system_prompt = agent.system_prompt.clone();
+    let model = agent.model.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel();
 
     let join = tokio::spawn(async move {
@@ -162,6 +175,8 @@ pub fn spawn_turn<S: NoteStore + Send + 'static>(
             backend,
             store,
             engine,
+            system_prompt,
+            model,
             session,
             user_message,
             note_preamble,
@@ -176,110 +191,194 @@ pub fn spawn_turn<S: NoteStore + Send + 'static>(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_turn<S: NoteStore + Send + 'static>(
-    backend: Arc<SendableProvider>,
+    backend: Arc<BackendClient>,
     store: Arc<dyn SessionStore>,
     engine: Arc<Mutex<TiroEngine<S>>>,
+    system_prompt: String,
+    model: String,
     mut session: AgentSession,
     user_message: String,
     note_preamble: Option<String>,
     tx: mpsc::UnboundedSender<AgentEvent>,
-    mut cancel_rx: oneshot::Receiver<()>,
+    cancel_rx: oneshot::Receiver<()>,
 ) -> AgentSession {
-    // Persist the user turn before kicking off the model so it's recoverable.
     let user_full = match note_preamble {
         Some(p) if !p.is_empty() => format!("{p}\n\n{user_message}"),
         _ => user_message,
     };
-    session.messages.push(TranscriptMessage::User(user_full));
+    session
+        .messages
+        .push(TranscriptMessage::User(user_full.clone()));
     let _ = store.save(&session);
 
-    let tools = build_llm_tools();
+    let history = build_chat_history(&session);
+    let prompt_msg = Message::user(&user_full);
+
+    match backend.as_ref() {
+        BackendClient::OpenAi(c) => {
+            drive_turn(
+                c,
+                &model,
+                &system_prompt,
+                engine,
+                prompt_msg,
+                history,
+                &mut session,
+                &store,
+                &tx,
+                cancel_rx,
+            )
+            .await;
+        }
+        BackendClient::Anthropic(c) => {
+            drive_turn(
+                c,
+                &model,
+                &system_prompt,
+                engine,
+                prompt_msg,
+                history,
+                &mut session,
+                &store,
+                &tx,
+                cancel_rx,
+            )
+            .await;
+        }
+        BackendClient::Ollama(c) => {
+            drive_turn(
+                c,
+                &model,
+                &system_prompt,
+                engine,
+                prompt_msg,
+                history,
+                &mut session,
+                &store,
+                &tx,
+                cancel_rx,
+            )
+            .await;
+        }
+    }
+
+    let _ = tx.send(AgentEvent::Done);
+    session
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_turn<C, S>(
+    client: &C,
+    model: &str,
+    system_prompt: &str,
+    engine: Arc<Mutex<TiroEngine<S>>>,
+    prompt: Message,
+    history: Vec<Message>,
+    session: &mut AgentSession,
+    store: &Arc<dyn SessionStore>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+    mut cancel_rx: oneshot::Receiver<()>,
+) where
+    C: CompletionClient,
+    C::CompletionModel: CompletionModel + 'static,
+    <C::CompletionModel as CompletionModel>::StreamingResponse: GetTokenUsage,
+    S: NoteStore + Send + 'static,
+{
+    let agent = client
+        .agent(model)
+        .preamble(system_prompt)
+        .default_max_turns(MAX_TURNS)
+        .tools(build_tools(engine))
+        .build();
+
+    let mut stream = agent.stream_chat(prompt, history).await;
+
+    // Buffer streamed assistant text so we can flush it as a single
+    // Assistant transcript entry when the model transitions to a tool
+    // call or finishes the turn.
+    let mut text_buf = String::new();
+    // Map rig's internal_call_id → tool name, so when a ToolResult event
+    // arrives (which only carries an id) we can name the corresponding
+    // transcript entry.
+    let mut call_names: HashMap<String, String> = HashMap::new();
 
     loop {
-        let history = build_chat_history(&session);
-        let provider: &dyn LLMProvider = backend.0.as_ref();
-        let stream_result = provider
-            .chat_stream_with_tools(&history, Some(&tools))
-            .await;
-        let mut stream = match stream_result {
-            Ok(s) => s,
-            Err(e) => {
-                push_error(&mut session, &store, &tx, format!("provider: {e}"));
-                break;
+        tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                push_error(session, store, tx, "turn cancelled".into());
+                return;
             }
-        };
-
-        let mut assistant_buf = String::new();
-        let mut pending_tool_calls: Vec<(String, String, Value)> = Vec::new();
-        // Indices in `pending_tool_calls` keyed by content-block index, used
-        // to assemble JSON deltas before the call is complete.
-        let mut partial_args: std::collections::HashMap<usize, String> =
-            std::collections::HashMap::new();
-        let mut block_index: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-
-        let cancelled = loop {
-            tokio::select! {
-                biased;
-                _ = &mut cancel_rx => break true,
-                next = stream.next() => match next {
-                    None => break false,
-                    Some(Err(e)) => {
-                        push_error(&mut session, &store, &tx, format!("stream: {e}"));
-                        return session;
-                    }
-                    Some(Ok(chunk)) => {
-                        consume_chunk(
-                            chunk,
-                            &mut assistant_buf,
-                            &mut pending_tool_calls,
-                            &mut partial_args,
-                            &mut block_index,
-                            &tx,
-                        );
-                    }
+            next = stream.next() => match next {
+                None => break,
+                Some(Err(e)) => {
+                    push_error(session, store, tx, format!("stream: {e}"));
+                    return;
+                }
+                Some(Ok(item)) => {
+                    handle_item(
+                        item,
+                        &mut text_buf,
+                        &mut call_names,
+                        session,
+                        store,
+                        tx,
+                    );
                 }
             }
-        };
-
-        if cancelled {
-            push_error(&mut session, &store, &tx, "turn cancelled".into());
-            break;
         }
+    }
 
-        // Finalise any tool calls that only delivered partial JSON.
-        for (idx, slot) in &block_index {
-            if let Some(raw) = partial_args.get(idx)
-                && let Some((_id, _name, args)) =
-                    pending_tool_calls.get_mut(*slot)
-                && matches!(args, Value::Null)
-            {
-                *args = serde_json::from_str(raw).unwrap_or(Value::Null);
+    flush_text(&mut text_buf, session, store, tx);
+}
+
+fn handle_item(
+    item: MultiTurnStreamItem<impl Clone>,
+    text_buf: &mut String,
+    call_names: &mut HashMap<String, String>,
+    session: &mut AgentSession,
+    store: &Arc<dyn SessionStore>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    match item {
+        MultiTurnStreamItem::StreamAssistantItem(content) => match content {
+            StreamedAssistantContent::Text(Text { text, .. }) => {
+                text_buf.push_str(&text);
+                let _ = tx.send(AgentEvent::Token(text));
             }
-        }
-
-        if !assistant_buf.is_empty() {
-            session
-                .messages
-                .push(TranscriptMessage::Assistant(assistant_buf.clone()));
-            let _ = tx.send(AgentEvent::AssistantMessageComplete);
-            let _ = store.save(&session);
-        }
-
-        if pending_tool_calls.is_empty() {
-            break;
-        }
-
-        for (_call_id, name, args) in pending_tool_calls {
-            let _ = tx.send(AgentEvent::ToolCall {
-                name: name.clone(),
-                args: args.clone(),
-            });
-            session.messages.push(TranscriptMessage::ToolCall {
-                name: name.clone(),
-                args: args.clone(),
-            });
-            let (result, is_error) = dispatch_tool(&engine, &name, &args);
+            StreamedAssistantContent::ToolCall {
+                tool_call,
+                internal_call_id,
+            } => {
+                flush_text(text_buf, session, store, tx);
+                let name = tool_call.function.name.clone();
+                let args = tool_call.function.arguments.clone();
+                call_names.insert(internal_call_id, name.clone());
+                let _ = tx.send(AgentEvent::ToolCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                });
+                session
+                    .messages
+                    .push(TranscriptMessage::ToolCall { name, args });
+                let _ = store.save(session);
+            }
+            // Tool-call deltas, reasoning, and per-turn final responses
+            // don't surface to the UI: we already emit text via the Text
+            // arm and the multi-turn FinalResponse below.
+            _ => {}
+        },
+        MultiTurnStreamItem::StreamUserItem(
+            StreamedUserContent::ToolResult {
+                tool_result,
+                internal_call_id,
+            },
+        ) => {
+            let name = call_names
+                .remove(&internal_call_id)
+                .unwrap_or_else(|| "unknown".to_string());
+            let raw = tool_result_to_text(&tool_result.content);
+            let (result, is_error) = decode_tool_result(&raw);
             let _ = tx.send(AgentEvent::ToolResult {
                 name: name.clone(),
                 result: result.clone(),
@@ -290,13 +389,29 @@ async fn run_turn<S: NoteStore + Send + 'static>(
                 result,
                 is_error,
             });
-            let _ = store.save(&session);
+            let _ = store.save(session);
         }
-        // Loop: feed tool results back to the model.
+        MultiTurnStreamItem::CompletionCall(_) => {}
+        MultiTurnStreamItem::FinalResponse(_) => {
+            flush_text(text_buf, session, store, tx);
+        }
+        _ => {}
     }
+}
 
-    let _ = tx.send(AgentEvent::Done);
-    session
+fn flush_text(
+    text_buf: &mut String,
+    session: &mut AgentSession,
+    store: &Arc<dyn SessionStore>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    if text_buf.is_empty() {
+        return;
+    }
+    let body = std::mem::take(text_buf);
+    session.messages.push(TranscriptMessage::Assistant(body));
+    let _ = tx.send(AgentEvent::AssistantMessageComplete);
+    let _ = store.save(session);
 }
 
 fn push_error(
@@ -310,100 +425,66 @@ fn push_error(
     let _ = store.save(session);
 }
 
-fn build_chat_history(session: &AgentSession) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = Vec::new();
-    for m in &session.messages {
+/// Reduce a [`OneOrMany<ToolResultContent>`] to a single string. Images
+/// are skipped because our tools never produce them; if one ever does,
+/// we record a placeholder rather than panicking.
+fn tool_result_to_text(content: &rig::OneOrMany<ToolResultContent>) -> String {
+    let mut out = String::new();
+    for part in content.iter() {
+        match part {
+            ToolResultContent::Text(t) => out.push_str(&t.text),
+            ToolResultContent::Image(_) => out.push_str("[image]"),
+        }
+    }
+    out
+}
+
+/// Parse the model-facing tool output back into JSON. Our tools always
+/// serialise to JSON, but rig also accepts raw text from foreign tools,
+/// so fall back to a wrapped string when parsing fails.
+fn decode_tool_result(raw: &str) -> (Value, bool) {
+    let value: Value = serde_json::from_str(raw)
+        .unwrap_or_else(|_| Value::String(raw.to_string()));
+    let is_error = value.as_object().is_some_and(|o| o.contains_key("error"));
+    (value, is_error)
+}
+
+/// Translate the persistent transcript into rig [`Message`]s for replay.
+/// Tool calls are dropped (rig manages tool history within a turn) and
+/// tool results are folded into user-context messages, matching the
+/// previous behaviour.
+fn build_chat_history(session: &AgentSession) -> Vec<Message> {
+    // The last User message in the transcript is the prompt we just
+    // pushed; skip it so it isn't duplicated when stream_chat is called
+    // with `prompt` + this history.
+    let mut history: Vec<Message> = Vec::new();
+    let messages = &session.messages;
+    let prompt_idx = messages
+        .iter()
+        .rposition(|m| matches!(m, TranscriptMessage::User(_)));
+    for (i, m) in messages.iter().enumerate() {
+        if Some(i) == prompt_idx {
+            continue;
+        }
         match m {
             TranscriptMessage::User(text) => {
-                out.push(ChatMessage {
-                    role: ChatRole::User,
-                    message_type: MessageType::Text,
-                    content: text.clone(),
-                });
+                history.push(Message::user(text));
             }
             TranscriptMessage::Assistant(text) => {
-                out.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    message_type: MessageType::Text,
-                    content: text.clone(),
-                });
+                history.push(Message::assistant(text));
             }
             TranscriptMessage::ToolResult { name, result, .. } => {
-                // No native Tool role -- inject as a user-context message.
-                out.push(ChatMessage {
-                    role: ChatRole::User,
-                    message_type: MessageType::Text,
-                    content: format!(
-                        "[tool result: {name}]\n{}",
-                        serde_json::to_string(result).unwrap_or_default()
-                    ),
+                let body = format!(
+                    "[tool result: {name}]\n{}",
+                    serde_json::to_string(result).unwrap_or_default()
+                );
+                history.push(Message::User {
+                    content: rig::OneOrMany::one(UserContent::text(body)),
                 });
             }
             TranscriptMessage::ToolCall { .. }
             | TranscriptMessage::SystemError(_) => {}
         }
     }
-    out
-}
-
-fn build_llm_tools() -> Vec<Tool> {
-    all_specs().into_iter().map(spec_to_tool).collect()
-}
-
-fn spec_to_tool(spec: ToolSpec) -> Tool {
-    Tool {
-        tool_type: "function".to_string(),
-        function: FunctionTool {
-            name: spec.name.to_string(),
-            description: spec.description.to_string(),
-            parameters: spec.parameters,
-        },
-        cache_control: None,
-    }
-}
-
-fn consume_chunk(
-    chunk: StreamChunk,
-    text_buf: &mut String,
-    tool_calls: &mut Vec<(String, String, Value)>,
-    partial_args: &mut std::collections::HashMap<usize, String>,
-    block_index: &mut std::collections::HashMap<usize, usize>,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
-) {
-    match chunk {
-        StreamChunk::Text(text) => {
-            text_buf.push_str(&text);
-            let _ = tx.send(AgentEvent::Token(text));
-        }
-        StreamChunk::ToolUseStart { index, id, name } => {
-            let slot = tool_calls.len();
-            tool_calls.push((id, name, Value::Null));
-            block_index.insert(index, slot);
-            partial_args.entry(index).or_default();
-        }
-        StreamChunk::ToolUseInputDelta {
-            index,
-            partial_json,
-        } => {
-            partial_args
-                .entry(index)
-                .or_default()
-                .push_str(&partial_json);
-        }
-        StreamChunk::ToolUseComplete { index, tool_call } => {
-            let args: Value =
-                serde_json::from_str(&tool_call.function.arguments)
-                    .unwrap_or(Value::Null);
-            if let Some(slot) = block_index.get(&index) {
-                if let Some(entry) = tool_calls.get_mut(*slot) {
-                    entry.0 = tool_call.id.clone();
-                    entry.1 = tool_call.function.name.clone();
-                    entry.2 = args;
-                }
-            } else {
-                tool_calls.push((tool_call.id, tool_call.function.name, args));
-            }
-        }
-        StreamChunk::Done { .. } => {}
-    }
+    history
 }
