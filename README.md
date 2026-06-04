@@ -2,6 +2,13 @@
 
 A TUI note-taking app with tag filtering and an optional embedded LLM agent.
 
+See video for example of agent in action:
+
+[Screencast_20260605_002744.webm](https://github.com/user-attachments/assets/87b8a2b5-0ee5-4aef-bddc-ac8bb5a21a81)
+
+> [!WARNING]
+> This is in pre-pre-pre-alpha. I'm using this tool myself and have a long list of teething bugs to work through. Use at your own peril.
+
 ## Build
 
 Requires a recent Rust toolchain (edition 2024).
