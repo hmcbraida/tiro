@@ -25,7 +25,7 @@ pub fn dispatch<S: NoteStore>(
         BaseMode::Search(s) => search::render(frame, area, s, engine),
         BaseMode::NoteView(nv) => note_view::render(frame, area, nv, engine),
     }
-    for overlay in &state.overlays {
+    for overlay in &mut state.overlays {
         match overlay {
             Overlay::TagPicker(tp) => {
                 tag_picker::render(frame, area, tp, engine)

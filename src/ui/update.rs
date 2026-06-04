@@ -196,12 +196,14 @@ pub fn apply<S: NoteStore + Send + 'static>(
         }
         Action::ScrollTranscriptUp => {
             if let Some(Overlay::AgentModal(m)) = state.overlays.last_mut() {
-                m.scroll = m.scroll.saturating_sub(4);
+                m.scroll = m.scroll.saturating_sub(1);
+                m.follow_tail = false;
             }
         }
         Action::ScrollTranscriptDown => {
             if let Some(Overlay::AgentModal(m)) = state.overlays.last_mut() {
-                m.scroll = m.scroll.saturating_add(4);
+                m.scroll = m.scroll.saturating_add(1).min(m.last_max_scroll);
+                m.follow_tail = m.scroll >= m.last_max_scroll;
             }
         }
     }
@@ -523,6 +525,8 @@ fn new_agent_session(state: &mut AppState, runtime: &AgentRuntime) {
     m.session = session;
     m.streaming_text.clear();
     m.scroll = 0;
+    m.last_max_scroll = 0;
+    m.follow_tail = true;
     m.in_flight = None;
 }
 
@@ -559,6 +563,8 @@ fn submit_session_picker(state: &mut AppState, runtime: &AgentRuntime) {
         m.session = session;
         m.streaming_text.clear();
         m.scroll = 0;
+        m.last_max_scroll = 0;
+        m.follow_tail = true;
         m.in_flight = None;
     }
 }

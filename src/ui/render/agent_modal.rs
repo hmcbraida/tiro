@@ -9,7 +9,7 @@ use crate::agent::session::TranscriptMessage;
 use super::super::state::AgentModalState;
 use super::super::theme;
 
-pub fn render(frame: &mut Frame, area: Rect, m: &AgentModalState) {
+pub fn render(frame: &mut Frame, area: Rect, m: &mut AgentModalState) {
     let popup = centered(area, 80, 80);
     frame.render_widget(Clear, popup);
 
@@ -49,7 +49,7 @@ fn render_header(frame: &mut Frame, area: Rect, m: &AgentModalState) {
     frame.render_widget(Paragraph::new(header), area);
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, m: &AgentModalState) {
+fn render_transcript(frame: &mut Frame, area: Rect, m: &mut AgentModalState) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(theme::border());
@@ -121,10 +121,14 @@ fn render_transcript(frame: &mut Frame, area: Rect, m: &AgentModalState) {
         }
     }
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((m.scroll, 0));
-    frame.render_widget(para, inner);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total = para.line_count(inner.width) as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    m.last_max_scroll = max_scroll;
+    if m.follow_tail || m.scroll > max_scroll {
+        m.scroll = max_scroll;
+    }
+    frame.render_widget(para.scroll((m.scroll, 0)), inner);
 }
 
 fn render_input(frame: &mut Frame, area: Rect, m: &AgentModalState) {

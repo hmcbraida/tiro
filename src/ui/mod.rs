@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
-    Event, EventStream, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -46,7 +47,7 @@ pub async fn run<S: NoteStore + Send + 'static>(
 fn setup_terminal() -> io::Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     // Ask supporting terminals (kitty, foot, wezterm, ghostty, alacritty
     // >=0.13, recent iTerm2) to disambiguate keys like Ctrl+/ vs Ctrl+_
     // and report shifted variants. On unsupported terminals these keys
@@ -72,6 +73,7 @@ fn restore_terminal(
     if enhanced_kbd {
         execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
     }
+    execute!(terminal.backend_mut(), DisableMouseCapture)?;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -114,6 +116,11 @@ async fn main_loop<S: NoteStore + Send + 'static>(
                         }
                         let _dismissed_error = state.error.take().is_some();
                         if let Some(action) = keymap.translate(key, &state) {
+                            update::apply(&mut state, action, &engine, &runtime);
+                        }
+                    }
+                    Some(Ok(Event::Mouse(ev))) => {
+                        if let Some(action) = keymap::translate_mouse(ev, &state) {
                             update::apply(&mut state, action, &engine, &runtime);
                         }
                     }

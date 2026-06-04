@@ -8,7 +8,7 @@ use crate::{
     store::NoteStore,
 };
 
-const PAGE_SIZE: usize = 20;
+const PAGE_SIZE: usize = 50;
 
 pub struct TiroEngine<S>
 where

@@ -132,6 +132,15 @@ pub struct AgentModalState {
     pub session: AgentSession,
     pub input: LineEditor,
     pub scroll: u16,
+    /// Maximum scroll offset computed by the last render (so update handlers
+    /// can clamp on key/mouse events without re-wrapping). Zero before any
+    /// render or when content fits in the viewport.
+    pub last_max_scroll: u16,
+    /// When true, the renderer pins `scroll` to `last_max_scroll` so new
+    /// content keeps the latest line in view. Cleared when the user
+    /// scrolls up; re-set when they scroll back to the bottom or submit
+    /// a new prompt.
+    pub follow_tail: bool,
     /// Set while a turn is streaming. When `Some`, the input area is
     /// replaced with a spinner + cancel hint.
     pub in_flight: Option<InFlight>,
@@ -151,6 +160,8 @@ impl AgentModalState {
             session,
             input: LineEditor::new(),
             scroll: 0,
+            last_max_scroll: 0,
+            follow_tail: true,
             in_flight: None,
             streaming_text: String::new(),
         }

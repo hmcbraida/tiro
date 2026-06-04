@@ -4,7 +4,9 @@
 //! context matches the current [`AppState`] wins. Precedence is encoded
 //! as binding order -- see [`Keymap::default`].
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+};
 
 use super::action::{Action, EditOp};
 use super::state::{AppState, BaseModeKind, OverlayKind};
@@ -304,6 +306,32 @@ impl Default for Keymap {
             action: Action::ToggleTagAt(9),
         });
         Self { bindings }
+    }
+}
+
+/// Map a mouse event to an action based on the current focus.
+///
+/// Wheel events are scoped to the AgentModal overlay; other contexts ignore
+/// them. We don't hit-test against the modal's rect (the renderer owns
+/// layout, not the keymap), but since the modal occupies the whole screen
+/// and steals focus while open, treating the wheel as modal-wide matches
+/// the user's intent.
+pub fn translate_mouse(ev: MouseEvent, state: &AppState) -> Option<Action> {
+    match ev.kind {
+        MouseEventKind::ScrollUp => match state.top_overlay().map(|o| o.kind())
+        {
+            Some(OverlayKind::AgentModal) => Some(Action::ScrollTranscriptUp),
+            _ => None,
+        },
+        MouseEventKind::ScrollDown => {
+            match state.top_overlay().map(|o| o.kind()) {
+                Some(OverlayKind::AgentModal) => {
+                    Some(Action::ScrollTranscriptDown)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
