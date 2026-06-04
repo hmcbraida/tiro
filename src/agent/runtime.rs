@@ -153,15 +153,16 @@ pub struct TurnHandle {
     pub cancel: oneshot::Sender<()>,
 }
 
-/// Spawn one streaming turn on the current tokio runtime. The session is
-/// mutated in place via the store; the UI receives transcript updates via
-/// `tx` and can cancel via the returned [`TurnHandle`].
+/// Spawn one streaming turn on the current tokio runtime. The caller must
+/// have already appended the user message (with any preamble) to
+/// `session`; this function persists that state, drives the model, and
+/// streams transcript updates via `tx`. Cancel via the returned
+/// [`TurnHandle`].
 pub fn spawn_turn<S: NoteStore + Send + 'static>(
     agent: &EnabledAgent,
     engine: Arc<Mutex<TiroEngine<S>>>,
     session: AgentSession,
     user_message: String,
-    note_preamble: Option<String>,
     tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> (TurnHandle, tokio::task::JoinHandle<AgentSession>) {
     let backend = agent.backend.clone();
@@ -179,7 +180,6 @@ pub fn spawn_turn<S: NoteStore + Send + 'static>(
             model,
             session,
             user_message,
-            note_preamble,
             tx,
             cancel_rx,
         )
@@ -198,21 +198,13 @@ async fn run_turn<S: NoteStore + Send + 'static>(
     model: String,
     mut session: AgentSession,
     user_message: String,
-    note_preamble: Option<String>,
     tx: mpsc::UnboundedSender<AgentEvent>,
     cancel_rx: oneshot::Receiver<()>,
 ) -> AgentSession {
-    let user_full = match note_preamble {
-        Some(p) if !p.is_empty() => format!("{p}\n\n{user_message}"),
-        _ => user_message,
-    };
-    session
-        .messages
-        .push(TranscriptMessage::User(user_full.clone()));
     let _ = store.save(&session);
 
     let history = build_chat_history(&session);
-    let prompt_msg = Message::user(&user_full);
+    let prompt_msg = Message::user(&user_message);
 
     match backend.as_ref() {
         BackendClient::OpenAi(c) => {

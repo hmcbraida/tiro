@@ -475,22 +475,26 @@ fn submit_agent_prompt<S: NoteStore + Send + 'static>(
     m.input.clear();
 
     let preamble = build_note_preamble(engine, &m.session.attached_note_ids);
+    let user_full = match preamble {
+        Some(p) if !p.is_empty() => format!("{p}\n\n{prompt}"),
+        _ => prompt,
+    };
+    m.session
+        .messages
+        .push(TranscriptMessage::User(user_full.clone()));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let session =
-        std::mem::replace(&mut m.session, AgentSession::new(String::new()));
+    let session_for_task = m.session.clone();
     let (handle, _join) =
-        spawn_turn(agent, engine.clone(), session, prompt, preamble, tx);
+        spawn_turn(agent, engine.clone(), session_for_task, user_full, tx);
     m.in_flight = Some(InFlight {
         events: rx,
         cancel: Some(handle),
     });
-    // The session moved into the task; the task will mutate it and we read
-    // it back via events. Keep a fresh placeholder until the user message
-    // (already appended in run_turn) shows up via TranscriptMessage events
-    // we mirror here in `tick`.
-    // For simplicity: re-load the latest session state from the store on
-    // each AssistantMessageComplete / Done.
+    // The background task owns its own copy of the session and persists
+    // it as the turn progresses; we mirror its events into `m.session`
+    // here so the UI updates live, and reload the canonical state from
+    // disk when the turn finishes (see `drain_agent_events`).
 }
 
 fn agent_cancel(state: &mut AppState) {
